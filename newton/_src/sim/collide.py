@@ -372,8 +372,14 @@ def _estimate_rigid_contact_max(model: Model) -> int:
 
 
 class CollisionPipeline:
-    """
+    """碰撞检测管线：从"哪些物体可能碰撞"到"精确接触点计算"的完整流程。
+
     Full-featured collision pipeline with GJK/MPR narrow phase and pluggable broad phase.
+
+    碰撞检测分三步：
+        1. 宽相（Broad Phase）：快速排除不可能碰撞的物体对（用 AABB 包围盒）
+        2. 窄相（Narrow Phase）：对宽相筛选出的候选对做精确碰撞检测（GJK/MPR 算法）
+        3. 软接触（Soft Contact）：粒子与形状之间的 SDF 距离查询（用于布料/可微仿真）
 
     Key features:
         - GJK/MPR algorithms for convex-convex collision detection
@@ -384,98 +390,247 @@ class CollisionPipeline:
 
     def __init__(
         self,
-        model: Model,
+        model: Model,                                                        # 仿真模型
         *,
-        reduce_contacts: bool = True,
-        rigid_contact_max: int | None = None,
-        shape_pairs_filtered: wp.array(dtype=wp.vec2i) | None = None,
-        soft_contact_max: int | None = None,
-        soft_contact_margin: float = 0.01,
-        requires_grad: bool | None = None,
-        broad_phase_mode: BroadPhaseMode = BroadPhaseMode.EXPLICIT,
-        sap_sort_type=None,
-        sdf_hydroelastic_config: SDFHydroelasticConfig | None = None,
+        reduce_contacts: bool = True,                                        # 是否做接触归约
+        rigid_contact_max: int | None = None,                                # 刚体接触最大数量（GPU 缓冲区大小）
+        shape_pairs_filtered: wp.array(dtype=wp.vec2i) | None = None,        # EXPLICIT 模式的预计算碰撞对
+        soft_contact_max: int | None = None,                                 # 软接触最大数量
+        soft_contact_margin: float = 0.01,                                   # 软接触感知范围（米）
+        requires_grad: bool | None = None,                                   # 是否支持梯度（True=只算可微的软接触）
+        broad_phase_mode: BroadPhaseMode = BroadPhaseMode.EXPLICIT,          # 宽相模式：NXN/SAP/EXPLICIT
+        sap_sort_type=None,                                                  # SAP 排序算法
+        sdf_hydroelastic_config: SDFHydroelasticConfig | None = None,        # SDF 弹性接触配置（高级）
     ):
-        """
-        Initialize the CollisionPipeline.
+        """Initialize the CollisionPipeline.
+        初始化碰撞检测管线。
 
         Args:
             model (Model): The simulation model.
+                仿真模型（包含所有形状、刚体、粒子信息）。
+
             reduce_contacts (bool, optional): Whether to reduce contacts for mesh-mesh collisions. Defaults to True.
+                是否对网格碰撞做接触归约。网格碰撞可能产生大量接触点，
+                归约后只保留最重要的几个，减少求解器的计算量。
+
             rigid_contact_max (int | None, optional): Maximum number of rigid contacts to allocate.
                 If None, estimated based on broad phase mode:
                 - EXPLICIT: len(shape_pairs_filtered) * 10 contacts
                 - NXN/SAP: shape_count * 20 contacts (assumes ~20 contacts per shape)
                 For better memory efficiency, use rigid_contact_max computed from actual collision pairs.
+                整个场景所有刚体接触点的 GPU 缓冲区总大小（不是单个物体的）。
+                GPU 不能动态分配内存，必须预先开好固定大小的数组。
+                碰撞检测时按顺序写入接触点，超出上限的接触点会被丢弃（导致穿透）。
+                设太小 → 接触丢失，物体穿透；设太大 → 浪费显存。
+                None 时自动估算，一般不需要手动设置。
+
             soft_contact_max (int | None, optional): Maximum number of soft contacts to allocate.
                 If None, computed as shape_count * particle_count.
+                整个场景所有粒子-形状软接触点的 GPU 缓冲区总大小。
+                默认 shape_count × particle_count（最坏情况：每个粒子碰每个形状），
+                通常远远用不完。布料/粒子仿真中会用到。
+
             soft_contact_margin (float, optional): Margin for soft contact generation. Defaults to 0.01.
+                软接触的感知范围（米）。粒子在此距离内才会与形状产生接触。
+                普通仿真: 0.01（省计算）
+                可微仿真: 设大（如 10.0），让梯度信号传得更远。
+
             requires_grad (bool | None, optional): Whether to enable gradient computation. If None, uses model.requires_grad.
+                控制碰撞检测算哪些类型（不是"梯度开不开"，而是"哪些碰撞类型参与计算"）。
+                False: 两种碰撞都算（rigid + soft），碰撞最完整，用于普通仿真。
+                True:  跳过 rigid contact，只算 soft contact，用于可微仿真。
+                       原因：GJK/MPR 窄相 kernel 编译时 enable_backward=False，
+                       没有反向代码，如果被 Tape 录进去 backward() 会出错。
+                       所以 requires_grad=True 时直接跳过，只走可微的 soft contact。
+                None:  跟随 model.requires_grad。
+
             broad_phase_mode (BroadPhaseMode, optional): Broad phase mode for collision detection.
                 - BroadPhaseMode.NXN: Use all-pairs AABB broad phase (O(N²), good for small scenes)
                 - BroadPhaseMode.SAP: Use sweep-and-prune AABB broad phase (O(N log N), better for larger scenes)
                 - BroadPhaseMode.EXPLICIT: Use precomputed shape pairs (most efficient when pairs known)
                 Defaults to BroadPhaseMode.EXPLICIT.
+                宽相检测模式，三种模式：
+                EXPLICIT: 预计算碰撞对，最高效，适合碰撞体不增减的场景。
+                NXN: 全对比较 O(N²)，适合形状少（<100）的场景。
+                SAP: 扫描排序剪枝 O(N log N)，适合形状多（>100）的场景。
+
             shape_pairs_filtered (wp.array | None, optional): Precomputed shape pairs for EXPLICIT mode.
                 When broad_phase_mode is BroadPhaseMode.EXPLICIT, uses model.shape_contact_pairs if not provided. For NXN/SAP modes, ignored.
+                EXPLICIT 模式下，告诉引擎"哪些形状对需要检测碰撞"。
+                每个元素是 vec2i(shape_a, shape_b)，例如 [(0,1), (0,2), (1,2)]。
+                不需要检测的对（如同一机器人上的相邻零件）会被排除。
+                一般不需要手动传——finalize() 时 Newton 自动算好存在
+                model.shape_contact_pairs 里，CollisionPipeline 会自动读取。
+
             sap_sort_type (SAPSortType | None, optional): Sorting algorithm for SAP broad phase.
                 Only used when broad_phase_mode is BroadPhaseMode.SAP. Options: SEGMENTED or TILE.
                 If None, uses default (SEGMENTED).
-            sdf_hydroelastic_config (SDFHydroelasticConfig | None, optional): Configuration for SDF hydroelastic collision handling. Defaults to None.
-        """
-        shape_count = model.shape_count
-        particle_count = model.particle_count
-        device = model.device
+                SAP 宽相内部对 AABB 排序时用的算法。
+                SEGMENTED（分段排序，默认）或 TILE（Tile 排序）。
+                只在 SAP 模式下有效，几乎不需要改。
 
-        # Estimate rigid_contact_max for collision pipeline (accounts for contact reduction)
+            sdf_hydroelastic_config (SDFHydroelasticConfig | None, optional): Configuration for SDF hydroelastic collision handling. Defaults to None.
+                高级功能：柔性表面碰撞模型。默认 None = 不启用。
+
+                【普通碰撞（默认）—— 两个面碰了记几个点？】
+
+                  两个盒子面贴面时：
+                    理论上整个面都在接触，有无穷多个接触点。
+                    实际上 GJK/MPR 算法只返回 1 个接触点（最深穿透点）：
+
+                      ┌──────────┐
+                      │  盒子A    │
+                      └─────●────┘  ← 只记录 1 个点
+                      ┌──────────┐
+                      │  盒子B    │
+                      └──────────┘
+
+                    但 1 个点不够！盒子会像陀螺一样绕接触点打转。
+                    需要至少 4 个点才能稳定支撑一个面。
+
+                    为什么 1 个点会打转？
+                      重力在盒子中心（向下），支撑力在接触点（向上），
+                      两者不在同一条线上 → 产生力矩 → 盒子绕接触点旋转。
+                      就像铅笔立在桌上，只有底部一点支撑，碰一下就倒。
+
+                    Newton 的解决方案：contact reduction（接触归约）
+                    把 1 个接触点"展开"成 4 个分散在接触面角上的点：
+
+                      ┌──────────┐
+                      │  盒子A    │
+                      └─●──●──●─●┘  ← 归约后 4 个点，像桌子 4 条腿
+                      ┌──────────┐      不管重力在哪，4 点总能平衡
+                      │  盒子B    │
+                      └──────────┘
+
+                    "归约"根据场景不同，可以是：
+                      少→多：GJK 只给 1 个点 → 展开成 4 个代表点
+                      多→少：网格碰撞产生几百个点 → 精简到有代表性的几个
+                    核心目的：得到数量合理、分布均匀的接触点集合。
+                    这就是 reduce_contacts=True 的作用。
+                    计算量小，适合大多数刚体仿真。
+
+                【Hydroelastic（柔性表面）—— 记多少个点？】
+
+                  不是记"几个点"，而是在接触面上生成网格，每个网格节点一个采样点：
+
+                      ┌──────────┐
+                      │  盒子A    │
+                      └──────────┘
+                      ╔══════════╗  ← 接触面被网格化
+                      ║●──●──●──●║
+                      ║│  │  │  │║    几十到几百个点
+                      ║●──●──●──●║    每个点有自己的压力
+                      ╚══════════╝
+                      ┌──────────┐
+                      │  盒子B    │
+                      └──────────┘
+
+                  Hydroelastic 的计算流程：
+                    1. 用两个物体的 SDF 计算重叠区域
+                    2. 在重叠区域生成接触面网格
+                    3. 在每个网格节点上计算压力
+                    → 接触力 = 所有节点的压力之和
+
+                  类比：
+                    普通碰撞    = 手指戳桌子（1 个接触点，力集中）
+                    Hydroelastic = 手掌按桌子（一整个面，力分散）
+
+                【对比总结】
+
+                                      普通碰撞              Hydroelastic
+                  接触点数量           1 个（归约后约 4 个）   几十~几百个
+                  力的分布             集中在SDFHydroelasticConfig上
+                  计算量               小                      大
+                  稳定性               归约后还行              天然稳定
+                  适用场景             大多数刚体仿真          轮胎/柔性夹爪/精确接触力
+                  Newton 中设置        默认（None）            传入 SDFHydroelasticConfig
+
+                【None 的含义】
+                  None 不是"没有接触点"！是"不用 Hydroelastic，用普通碰撞"。
+                  普通碰撞（GJK/MPR + 归约）仍然正常工作，接触点一个不少。
+
+                【SDFHydroelasticConfig 的所有配置项】
+                  源码位置: newton/_src/geometry/sdf_hydroelastic.py 第 102-133 行
+
+                  SDFHydroelasticConfig(
+                    reduce_contacts=True,      # 是否归约接触点（True=精简,False=全部保留）
+                    buffer_mult_broad=1,       # 宽相缓冲区倍率（溢出报警时增大）
+                    buffer_mult_iso=1,         # 等值面提取缓冲区倍率（溢出时增大）
+                    buffer_mult_contact=1,     # 接触点缓冲区倍率（溢出时增大）
+                    grid_size=256*8*128,       # 网格大小（性能调优用）
+                    output_contact_surface=False,  # 是否输出接触面顶点（用于可视化调试）
+                    normal_matching=True,      # 归约后旋转法线，使合力方向一致
+                    anchor_contact=False,      # 在压力中心添加锚点接触（保持力矩平衡）
+                    moment_matching=False,     # 缩放摩擦系数匹配力矩（需 anchor_contact=True）
+                    margin_contact_area=1e-2,  # 非穿透边缘接触的面积
+                  )
+                  大多数情况用默认值就行，只有溢出报警时才需要增大 buffer_mult_* 。
+        """
+        # ─── 第1步：读取模型基本信息 ───
+        shape_count = model.shape_count      # 场景中碰撞形状的数量
+        particle_count = model.particle_count  # 粒子数量（布料/软体的顶点）
+        device = model.device                # GPU 设备（如 "cuda:0"）
+
+        # ─── 第2步：估算接触缓冲区大小 ───
+        # GPU 需要预分配固定大小的缓冲区存放碰撞结果
         if rigid_contact_max is None:
             rigid_contact_max = _estimate_rigid_contact_max(model)
         self.rigid_contact_max = rigid_contact_max
         if requires_grad is None:
             requires_grad = model.requires_grad
 
-        # For EXPLICIT mode, use provided shape_pairs_filtered or fall back to model pairs
+        # ─── 第3步：准备 EXPLICIT 模式的碰撞对 ───
+        # EXPLICIT 模式在 finalize() 时就预计算好了哪些形状对需要检测
         if shape_pairs_filtered is None and broad_phase_mode == BroadPhaseMode.EXPLICIT:
             shape_pairs_filtered = getattr(model, "shape_contact_pairs", None)
 
-        # Initialize SDF hydroelastic (returns None if no hydroelastic shape pairs in the model)
+        # ─── 第4步：初始化 SDF 弹性接触（高级功能，通常为 None）───
         sdf_hydroelastic = SDFHydroelastic._from_model(model, config=sdf_hydroelastic_config, writer_func=write_contact)
 
-        # Detect if any mesh shapes are present to optimize kernel launches
+        # ─── 第5步：检测是否有网格形状（网格碰撞需要特殊处理）───
         has_meshes = False
         if hasattr(model, "shape_type") and model.shape_type is not None:
             shape_types = model.shape_type.numpy()
             has_meshes = bool((shape_types == int(GeoType.MESH)).any())
 
-        shape_world = getattr(model, "shape_world", None)
-        shape_flags = getattr(model, "shape_flags", None)
+        shape_world = getattr(model, "shape_world", None)  # 每个形状属于哪个世界
+        shape_flags = getattr(model, "shape_flags", None)  # 形状的碰撞标志
 
         self.model = model
         self.shape_count = shape_count
         self.broad_phase_mode = broad_phase_mode
         self.device = device
         self.reduce_contacts = reduce_contacts
+        # 最大可能的碰撞对数 = C(N, 2) = N*(N-1)/2
         self.shape_pairs_max = (shape_count * (shape_count - 1)) // 2
 
-        # For NXN/SAP, build sorted exclusion array from model.shape_collision_filter_pairs
+        # ─── 第6步：构建碰撞排除列表（NXN/SAP 模式用）───
+        # 某些形状对不应该碰撞（比如同一个关节链上相邻的两个连杆）
         shape_pairs_excluded = None
         if broad_phase_mode in (BroadPhaseMode.NXN, BroadPhaseMode.SAP) and hasattr(
             model, "shape_collision_filter_pairs"
         ):
             filters = model.shape_collision_filter_pairs
             if filters:
-                sorted_pairs = sorted(filters)  # lexicographic (already canonical min,max)
+                sorted_pairs = sorted(filters)
                 shape_pairs_excluded = wp.array(
                     np.array(sorted_pairs),
                     dtype=wp.vec2i,
                     device=model.device,
                 )
-            # else: leave None
 
         self.shape_pairs_excluded = shape_pairs_excluded
         self.shape_pairs_excluded_count = shape_pairs_excluded.shape[0] if shape_pairs_excluded is not None else 0
 
-        # Initialize broad phase
+        # ─── 第7步：初始化宽相检测器（三选一）───
+        #
+        # 宽相的作用：快速过滤掉不可能碰撞的形状对
+        # 方法：比较 AABB（轴对齐包围盒），不重叠就不可能碰撞
+        #
+        #   NXN:      遍历所有对                → O(N²)，简单但慢
+        #   SAP:      沿轴排序后扫描             → O(N log N)，大场景更快
+        #   EXPLICIT: 直接用预计算好的碰撞对列表  → O(K)，K 是碰撞对数，最快
         if self.broad_phase_mode == BroadPhaseMode.NXN:
             if shape_world is None:
                 raise ValueError("shape_world must be provided when using BroadPhaseMode.NXN")
@@ -504,20 +659,21 @@ class CollisionPipeline:
             self.shape_pairs_filtered = shape_pairs_filtered
             self.shape_pairs_max = len(shape_pairs_filtered)
 
-        # Allocate buffers
+        # ─── 第8步：预分配 GPU 缓冲区 ───
+        # 宽相结果：哪些形状对通过了 AABB 重叠测试
+        # AABB 缓冲区：每个形状的包围盒下界/上界
         with wp.ScopedDevice(device):
             self.broad_phase_pair_count = wp.zeros(1, dtype=wp.int32, device=device)
             self.broad_phase_shape_pairs = wp.zeros(self.shape_pairs_max, dtype=wp.vec2i, device=device)
             self.shape_aabb_lower = wp.zeros(shape_count, dtype=wp.vec3, device=device)
             self.shape_aabb_upper = wp.zeros(shape_count, dtype=wp.vec3, device=device)
 
-        # Initialize narrow phase with pre-allocated buffers
-        # Pass AABB arrays so narrow phase can use them instead of computing AABBs internally
-        # max_triangle_pairs is a conservative estimate for mesh collision triangle pairs
-        # Pass write_contact as custom writer to write directly to final Contacts format
+        # ─── 第9步：初始化窄相检测器 ───
+        # 窄相对宽相筛选出的候选对做精确碰撞检测（GJK/MPR 算法）
+        # 输出：精确的接触点位置、法线、穿透深度
         self.narrow_phase = NarrowPhase(
             max_candidate_pairs=self.shape_pairs_max,
-            max_triangle_pairs=1000000,
+            max_triangle_pairs=1000000,   # 网格碰撞的三角形对数上限
             reduce_contacts=self.reduce_contacts,
             device=device,
             shape_aabb_lower=self.shape_aabb_lower,
@@ -528,11 +684,12 @@ class CollisionPipeline:
         )
         self.sdf_hydroelastic = self.narrow_phase.sdf_hydroelastic
 
+        # ─── 第10步：窄相的几何数据缓冲区 ───
         with wp.ScopedDevice(device):
-            # Narrow phase input arrays
-            self.geom_data = wp.zeros(shape_count, dtype=wp.vec4, device=device)
-            self.geom_transform = wp.zeros(shape_count, dtype=wp.transform, device=device)
+            self.geom_data = wp.zeros(shape_count, dtype=wp.vec4, device=device)       # 几何参数（半径等）
+            self.geom_transform = wp.zeros(shape_count, dtype=wp.transform, device=device)  # 世界空间变换
 
+        # ─── 第11步：软接触参数 ───
         if soft_contact_max is None:
             soft_contact_max = shape_count * particle_count
         self.soft_contact_margin = soft_contact_margin

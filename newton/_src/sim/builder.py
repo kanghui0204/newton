@@ -83,6 +83,8 @@ class ModelBuilder:
     which are convenient but unsuitable for efficient simulation.
     Call :meth:`finalize` to construct a simulation-ready Model.
 
+    场景构建器（CPU 端）。用 Python 列表存储数据，finalize() 后转成 GPU 端的 Model。
+
     Example
     -------
 
@@ -151,50 +153,96 @@ class ModelBuilder:
 
     @dataclass
     class ShapeConfig:
-        """
-        Represents the properties of a collision shape used in simulation.
+        """Represents the properties of a collision shape used in simulation.
+        碰撞形状的材质和碰撞属性配置。
+
+        每个 add_shape_*() 方法都接受一个 ShapeConfig 参数（简写 cfg）。
+        如果不传，使用 builder.default_shape_cfg（默认值）。
+
+        ShapeConfig 主要控制三类属性：
+          1. 物理材质：density(密度)、mu(摩擦)、restitution(弹性)
+          2. 碰撞行为：ke(接触刚度)、kd(阻尼)、thickness(表面厚度)
+          3. 碰撞过滤：collision_group、has_shape_collision、has_particle_collision
+
+        使用示例：
+            # 方式1：使用默认配置
+            builder.add_shape_box(body=0, hx=0.5, hy=0.5, hz=0.5)
+
+            # 方式2：自定义配置
+            cfg = newton.ModelBuilder.ShapeConfig(density=500.0, mu=0.8, ke=5e3)
+            builder.add_shape_box(body=0, hx=0.5, hy=0.5, hz=0.5, cfg=cfg)
+
+            # 方式3：修改默认配置（影响后续所有 add_shape_*）
+            builder.default_shape_cfg.mu = 0.8
         """
 
+        # ─── 物理材质参数 ───
         density: float = 1000.0
-        """The density of the shape material."""
+        """The density of the shape material.
+        密度 (kg/m³)。finalize 时根据 density × 体积自动计算质量和惯性张量。
+        设为 0 → 该形状不贡献质量（body 变成运动学体/固定体）。"""
         ke: float = 2.5e3
-        """The contact elastic stiffness. Used by SemiImplicit, Featherstone, MuJoCo."""
+        """The contact elastic stiffness. Used by SemiImplicit, Featherstone, MuJoCo.
+        接触弹性刚度。碰撞穿透时的"弹簧硬度"：力 = ke × 穿透深度。
+        越大越硬（穿透越小），但太大会导致数值不稳定。"""
         kd: float = 100.0
-        """The contact damping coefficient. Used by SemiImplicit, Featherstone, MuJoCo."""
+        """The contact damping coefficient. Used by SemiImplicit, Featherstone, MuJoCo.
+        接触阻尼。减少碰撞后的弹跳：阻尼力 = kd × 相对法向速度。"""
         kf: float = 1000.0
-        """The friction damping coefficient. Used by SemiImplicit, Featherstone."""
+        """The friction damping coefficient. Used by SemiImplicit, Featherstone.
+        摩擦力刚度。控制滑动摩擦力的大小。"""
         ka: float = 0.0
-        """The contact adhesion distance. Used by SemiImplicit, Featherstone."""
+        """The contact adhesion distance. Used by SemiImplicit, Featherstone.
+        粘附距离。在此距离内产生吸引力（模拟胶水/静电吸附）。0=无粘附。"""
         mu: float = 0.5
-        """The coefficient of friction. Used by all solvers."""
+        """The coefficient of friction. Used by all solvers.
+        摩擦系数。0=完全光滑（冰面），1.0=很粗糙（橡胶地面）。"""
         restitution: float = 0.0
-        """The coefficient of restitution. Used by XPBD. To take effect, enable restitution in solver constructor via ``enable_restitution=True``."""
+        """The coefficient of restitution. Used by XPBD. To take effect, enable restitution in solver constructor via ``enable_restitution=True``.
+        弹性碰撞系数。0=完全非弹性（泥巴），1.0=完全弹性（弹力球）。
+        只有 XPBD 求解器用，且需要 enable_restitution=True。"""
         torsional_friction: float = 0.25
-        """The coefficient of torsional friction (resistance to spinning at contact point). Used by XPBD, MuJoCo."""
+        """The coefficient of torsional friction (resistance to spinning at contact point). Used by XPBD, MuJoCo.
+        扭转摩擦系数。阻止物体在接触点原地旋转（陀螺效应）。"""
         rolling_friction: float = 0.0005
-        """The coefficient of rolling friction (resistance to rolling motion). Used by XPBD, MuJoCo."""
+        """The coefficient of rolling friction (resistance to rolling motion). Used by XPBD, MuJoCo.
+        滚动摩擦系数。阻止物体滚动（球在地面上会慢慢停下来）。"""
+
+        # ─── 碰撞检测参数 ───
         thickness: float = 1e-5
         """Outward offset from the shape's surface for collision detection.
         Extends the effective collision surface outward by this amount. When two shapes collide,
-        their thicknesses are summed (thickness_a + thickness_b) to determine the total separation."""
+        their thicknesses are summed (thickness_a + thickness_b) to determine the total separation.
+        表面厚度。让碰撞面向外膨胀一点，避免"刚好贴着"时漏检。"""
         contact_margin: float | None = None
         """The contact margin for collision detection. If None, uses builder.rigid_contact_margin as default.
         AABBs are expanded by this value for broad phase detection. Must be >= thickness to ensure
-        collisions are not missed when thickened surfaces approach each other."""
+        collisions are not missed when thickened surfaces approach each other.
+        碰撞边距。AABB 包围盒向外扩大的距离，用于宽相检测。"""
+
+        # ─── 碰撞过滤参数 ───
         is_solid: bool = True
-        """Indicates whether the shape is solid or hollow. Defaults to True."""
+        """Indicates whether the shape is solid or hollow. Defaults to True.
+        是否实心。True=实心（SDF 内部为负），False=空心。"""
         collision_group: int = 1
-        """The collision group ID for the shape. Defaults to 1 (default group). Set to 0 to disable collisions for this shape."""
+        """The collision group ID for the shape. Defaults to 1 (default group). Set to 0 to disable collisions for this shape.
+        碰撞组 ID。同一组的形状之间可能碰撞。设为 0 = 禁用该形状的碰撞。"""
         collision_filter_parent: bool = True
-        """Whether to inherit collision filtering from the parent. Defaults to True."""
+        """Whether to inherit collision filtering from the parent. Defaults to True.
+        是否继承父体的碰撞过滤。True=同一关节链上相邻连杆不碰撞。"""
         has_shape_collision: bool = True
-        """Whether the shape can collide with other shapes. Defaults to True."""
+        """Whether the shape can collide with other shapes. Defaults to True.
+        是否参与刚体-刚体碰撞（rigid contact）。"""
         has_particle_collision: bool = True
-        """Whether the shape can collide with particles. Defaults to True."""
+        """Whether the shape can collide with particles. Defaults to True.
+        是否参与粒子-形状碰撞（soft contact）。"""
         is_visible: bool = True
-        """Indicates whether the shape is visible in the simulation. Defaults to True."""
+        """Indicates whether the shape is visible in the simulation. Defaults to True.
+        是否在 Viewer 中可见。"""
         is_site: bool = False
-        """Indicates whether the shape is a site (non-colliding reference point). Directly setting this to True will NOT enforce site invariants. Use `mark_as_site()` or set via the `flags` property to ensure invariants. Defaults to False."""
+        """Indicates whether the shape is a site (non-colliding reference point). Directly setting this to True will NOT enforce site invariants. Use `mark_as_site()` or set via the `flags` property to ensure invariants. Defaults to False.
+        是否是"站点"（site）——一个不参与碰撞的参考点，用于传感器安装等。
+        设为 True 时自动禁用碰撞并设 density=0。建议用 mark_as_site() 方法设置。"""
         sdf_narrow_band_range: tuple[float, float] = (-0.1, 0.1)
         """The narrow band distance range (inner, outer) for SDF computation. Only used for mesh shapes when SDF is enabled."""
         sdf_target_voxel_size: float | None = None
@@ -292,8 +340,31 @@ class ModelBuilder:
             return copy.copy(self)
 
     class JointDofConfig:
-        """
-        Describes a joint axis (a single degree of freedom) that can have limits and be driven towards a target.
+        """Describes a joint axis (a single degree of freedom) that can have limits and be driven towards a target.
+        关节单个自由度的配置：限位、PD 控制器增益、摩擦等。
+
+        每个关节可以有 1~6 个自由度(DOF)，每个 DOF 有自己的 JointDofConfig。
+        例如旋转关节有 1 个 DOF，球关节有 3 个 DOF。
+
+        PD 控制器:
+          控制力 = target_ke × (target_pos - current_pos) - target_kd × current_vel
+          target_ke = 0 且 target_kd = 0 → 关节不受控制（自由运动）
+          target_ke > 0 → 关节会往 target_pos 方向运动（像弹簧拉着）
+
+        限位:
+          limit_lower/upper = 关节的活动范围
+          超出范围时用弹簧力推回来：力 = limit_ke × 超出量
+
+        使用示例:
+            # 旋转关节，限制在 -90° ~ 90°，带 PD 控制
+            builder.add_joint_revolute(
+                ...,
+                dof_config=newton.ModelBuilder.JointDofConfig(
+                    axis=newton.Axis.Y,
+                    limit_lower=-1.57, limit_upper=1.57,
+                    target_ke=100.0, target_kd=10.0,
+                ),
+            )
         """
 
         def __init__(
@@ -314,36 +385,52 @@ class ModelBuilder:
             actuator_mode: ActuatorMode | None = None,
         ):
             self.axis = wp.normalize(axis_to_vec3(axis))
-            """The 3D joint axis in the joint parent anchor frame."""
+            """The 3D joint axis in the joint parent anchor frame.
+            关节轴方向（在父体锚点坐标系中）。旋转关节绕此轴转，滑动关节沿此轴移动。"""
             self.limit_lower = limit_lower
-            """The lower position limit of the joint axis. Defaults to -MAXVAL (unlimited)."""
+            """The lower position limit of the joint axis. Defaults to -MAXVAL (unlimited).
+            关节下限（弧度或米）。-MAXVAL = 无下限。"""
             self.limit_upper = limit_upper
-            """The upper position limit of the joint axis. Defaults to MAXVAL (unlimited)."""
+            """The upper position limit of the joint axis. Defaults to MAXVAL (unlimited).
+            关节上限。MAXVAL = 无上限。超出限位时用弹簧力推回来。"""
             self.limit_ke = limit_ke
-            """The elastic stiffness of the joint axis limits. Defaults to 1e4."""
+            """The elastic stiffness of the joint axis limits. Defaults to 1e4.
+            限位弹簧刚度。超出限位时：力 = limit_ke × 超出量。"""
             self.limit_kd = limit_kd
-            """The damping stiffness of the joint axis limits. Defaults to 1e1."""
+            """The damping stiffness of the joint axis limits. Defaults to 1e1.
+            限位阻尼。防止关节在限位边界反复弹跳。"""
             self.target_pos = target_pos
             """The target position of the joint axis.
             If the initial `target_pos` is outside the limits,
-            it defaults to the midpoint of `limit_lower` and `limit_upper`. Otherwise, defaults to 0.0."""
+            it defaults to the midpoint of `limit_lower` and `limit_upper`. Otherwise, defaults to 0.0.
+            PD 控制器的目标位置。运行时可通过 Control.joint_target_pos 动态修改。"""
             self.target_vel = target_vel
-            """The target velocity of the joint axis."""
+            """The target velocity of the joint axis.
+            PD 控制器的目标速度。"""
             self.target_ke = target_ke
-            """The proportional gain of the target drive PD controller. Defaults to 0.0."""
+            """The proportional gain of the target drive PD controller. Defaults to 0.0.
+            PD 控制器的 P 增益（弹簧刚度）。0 = 关节不受位置控制。
+            控制力 = target_ke × (target_pos - current_pos) - target_kd × velocity。"""
             self.target_kd = target_kd
-            """The derivative gain of the target drive PD controller. Defaults to 0.0."""
+            """The derivative gain of the target drive PD controller. Defaults to 0.0.
+            PD 控制器的 D 增益（阻尼）。0 = 关节不受速度控制。"""
             self.armature = armature
-            """Artificial inertia added around the joint axis. Defaults to 1e-2."""
+            """Artificial inertia added around the joint axis. Defaults to 1e-2.
+            人为添加的关节惯性。防止"零惯性"导致数值奇异性。
+            类比：给电机加一个小飞轮，让运动更平滑。"""
             self.effort_limit = effort_limit
-            """Maximum effort (force or torque) the joint axis can exert. Defaults to 1e6."""
+            """Maximum effort (force or torque) the joint axis can exert. Defaults to 1e6.
+            关节最大力/力矩限制。模拟电机的扭矩上限。"""
             self.velocity_limit = velocity_limit
-            """Maximum velocity the joint axis can achieve. Defaults to 1e6."""
+            """Maximum velocity the joint axis can achieve. Defaults to 1e6.
+            关节最大速度限制。模拟电机的转速上限。"""
             self.friction = friction
-            """Friction coefficient for the joint axis. Defaults to 0.0."""
+            """Friction coefficient for the joint axis. Defaults to 0.0.
+            关节摩擦。模拟关节轴承的摩擦阻力。0 = 无摩擦（理想关节）。"""
             self.actuator_mode = actuator_mode
             """Actuator mode for this DOF. Determines which actuators are installed (see :class:`ActuatorMode`).
-            If None, the mode is inferred from gains and targets."""
+            If None, the mode is inferred from gains and targets.
+            驱动器模式。NONE=被动关节, POSITION=位置控制, VELOCITY=速度控制, FORCE=力控制。"""
 
             if self.target_pos > self.limit_upper or self.target_pos < self.limit_lower:
                 self.target_pos = 0.5 * (self.limit_lower + self.limit_upper)
@@ -366,13 +453,22 @@ class ModelBuilder:
 
     @dataclass
     class CustomAttribute:
-        """
-        Represents a custom attribute definition for the ModelBuilder.
+        """Represents a custom attribute definition for the ModelBuilder.
+        自定义属性：让求解器（如 MuJoCo）在 Model/State/Control/Contacts 上挂载额外数据。
+
         This is used to define custom attributes that are not part of the standard ModelBuilder API.
         Custom attributes can be defined for the :class:`~newton.Model`, :class:`~newton.State`, :class:`~newton.Control`, or :class:`~newton.Contacts` objects, depending on the :class:`Model.AttributeAssignment` category.
         Custom attributes must be declared before use via the :meth:`newton.ModelBuilder.add_custom_attribute` method.
 
         See :ref:`custom_attributes` for more information.
+
+        为什么需要 CustomAttribute？
+          Newton 的标准属性（body_q, joint_f 等）不能覆盖所有求解器的需求。
+          比如 MuJoCo 求解器需要额外的 ctrl（控制信号）、pair（碰撞对）等数据。
+          CustomAttribute 让求解器可以在 finalize 时向 Model/Control 上添加自己的数据。
+
+        普通用户一般不需要直接创建 CustomAttribute。
+        它主要由 SolverMuJoCo.register_custom_attributes() 等内部方法使用。
         """
 
         name: str
@@ -556,6 +652,7 @@ class ModelBuilder:
             gravity (float, optional): The magnitude of gravity to apply along the up axis.
                 Defaults to -9.81.
         """
+        # 初始化空的场景蓝图。内部创建几十个 Python 列表，等待 add_* 方法填充。
         self.num_worlds = 0
 
         # region defaults
@@ -1308,6 +1405,7 @@ class ModelBuilder:
                 For example, (5.0, 5.0, 0.0) arranges copies in a 2D grid in the XY plane.
                 Defaults to (0.0, 0.0, 0.0).
         """
+        # 将一个 builder 的内容复制 num_worlds 次。每个副本是独立的世界，物理互不影响。
         offsets = compute_world_offsets(num_worlds, spacing, self.up_axis)
         xform = wp.transform_identity()
         for i in range(num_worlds):
@@ -1345,6 +1443,7 @@ class ModelBuilder:
                 # Create articulation from the joints
                 builder.add_articulation([joint1, joint2, joint3])
         """
+        # 将多个关节组成一个关节链（articulation）。关节链内的关节会被当作一个整体求解。
         if not joints:
             raise ValueError("Cannot create an articulation with no joints")
 
@@ -2684,6 +2783,8 @@ class ModelBuilder:
         Note:
             If the mass is zero then the body is treated as kinematic with no dynamics.
 
+        添加一个刚体。body 是物理实体的载体，需要通过 add_shape_* 附加碰撞形状。
+
         """
         # Create the link
         body_id = self.add_link(
@@ -2907,6 +3008,8 @@ class ModelBuilder:
         **kwargs,
     ) -> int:
         """Adds a revolute (hinge) joint to the model. It has one degree of freedom.
+
+        添加旋转关节（1 自由度，像门铰链）。parent_xform 和 child_xform 的点在世界中始终重合。
 
         Args:
             parent: The index of the parent body.
@@ -4482,6 +4585,7 @@ class ModelBuilder:
         Returns:
             int: The index of the newly added shape.
         """
+        # 添加无限大地面（z=0 处的水平面）。body=-1（固定到世界）。
         return self.add_shape_plane(
             plane=(*self.up_vector, -height),
             width=0.0,
@@ -4632,6 +4736,7 @@ class ModelBuilder:
         Returns:
             int: The index of the newly added shape or site.
         """
+        # 添加长方体碰撞形状。hx/hy/hz 是半尺寸，实际尺寸是 2*hx × 2*hy × 2*hz。
         if cfg is None:
             cfg = self.default_site_cfg if as_site else self.default_shape_cfg
         elif as_site:
@@ -6393,6 +6498,7 @@ class ModelBuilder:
             fix_top: Make the top-most edge of particles kinematic
             fix_bottom: Make the bottom-most edge of particles kinematic
         """
+        # 添加布料网格。内部生成粒子网格 → 两两连成三角形 → 创建弹簧/边缘。
 
         def grid_index(x, y, dim_x):
             return y * dim_x + x
@@ -8185,36 +8291,59 @@ class ModelBuilder:
             - Sets up all arrays and properties required for simulation, including particles, bodies, shapes,
               joints, springs, muscles, constraints, and collision/contact data.
         """
+        # =====================================================================
+        # finalize() 完整流程（约 870 行）
+        # =====================================================================
+        # 这是 Newton 最核心的函数。
+        # 作用：把 CPU 端的 Python 列表全部转成 GPU 端的 wp.array。
+        #
+        # 整体结构非常规律：
+        #   1. 验证阶段：检查数据合法性
+        #   2. 转换阶段：逐类数据 Python list → numpy → wp.array(GPU)
+        #   3. 预计算阶段：AABB、SDF、碰撞对、惯性修正等
+        #   4. 设置计数：body_count、joint_count 等
+        #   5. 返回 Model
+        # =====================================================================
 
+        # ─── 验证阶段 ─── 检查场景数据是否合法
         # ensure the world count is set correctly
         self.num_worlds = max(1, self.num_worlds)
 
         # validate world ordering and contiguity
+        # 验证：世界编号是否连续（0,1,2,...不能跳过）
         if not skip_all_validations and not skip_validation_worlds:
             self._validate_world_ordering()
 
         # validate joints belong to an articulation
+        # 验证：每个关节是否属于一个 articulation（关节链）
         if not skip_all_validations and not skip_validation_joints:
             self._validate_joints()
 
         # validate shapes have valid contact margins
+        # 验证：形状的碰撞边距是否合理
         if not skip_all_validations and not skip_validation_shapes:
             self._validate_shapes()
 
         # validate structural invariants (body/joint references, array lengths)
+        # 验证：body/joint/shape 的引用关系是否正确（子体是否存在、索引是否越界等）
         if not skip_all_validations and not skip_validation_structure:
             self._validate_structure()
 
         # validate DFS topological joint ordering (opt-in, skipped by default)
+        # 验证：关节的拓扑顺序（父体必须在子体之前定义）
         if not skip_all_validations and not skip_validation_joint_ordering:
             self.validate_joint_ordering()
 
         # construct world starts by ensuring they are cumulative and appending
         # tail-end global counts and sum total counts over the entire model.
         # This method also performs relevant validation checks on the start.
+        # 构建每个世界的起始索引（body_world_start, shape_world_start 等）
         self._build_world_starts()
 
+        # ─── 转换阶段 ─── Python list → GPU array
+
         # construct particle inv masses
+        # 计算粒子质量的倒数（mass=0 的粒子 → inv_mass=0 → 固定不动）
         ms = np.array(self.particle_mass, dtype=np.float32)
         # static particles (with zero mass) have zero inverse mass
         particle_inv_mass = np.divide(1.0, ms, out=np.zeros_like(ms), where=ms != 0.0)
@@ -8222,6 +8351,7 @@ class ModelBuilder:
         with wp.ScopedDevice(device):
             # -------------------------------------
             # construct Model (non-time varying) data
+            # 创建空 Model 对象，后续逐步填充属性
 
             m = Model(device)
             m.request_contact_attributes(*self._requested_contact_attributes)
@@ -8232,6 +8362,8 @@ class ModelBuilder:
 
             # ---------------------
             # particles
+            # 粒子数据：Python list → wp.array(GPU)
+            # requires_grad=True 时数组支持梯度追踪（用于可微仿真）
 
             # state (initial)
             m.particle_q = wp.array(self.particle_q, dtype=wp.vec3, requires_grad=requires_grad)

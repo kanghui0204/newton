@@ -26,6 +26,8 @@ class Control:
 
     The exact attributes depend on the contents of the model. Control objects
     should generally be created using the :func:`newton.Model.control()` function.
+
+    控制输入：你给仿真系统发的"命令"——关节力、目标位置、目标速度等。
     """
 
     def __init__(self):
@@ -43,18 +45,20 @@ class Control:
         .. note::
             The Featherstone solver currently applies free-joint forces in the body-origin frame instead of the
             center-of-mass frame, which can lead to unexpected rotation when applying linear force to a body with a non-zero COM offset.
+
+        给每个关节自由度直接施加的力/力矩。比如给电机施加 10N·m 扭矩。
         """
         self.joint_target_pos: wp.array | None = None
-        """Per-DOF position targets, shape ``(joint_dof_count,)``, type ``float`` (optional)."""
+        """Per-DOF position targets, shape ``(joint_dof_count,)``, type ``float`` (optional). 关节目标位置（配合 PD 控制器：力 = ke*(目标-当前) - kd*速度）。"""
 
         self.joint_target_vel: wp.array | None = None
-        """Per-DOF velocity targets, shape ``(joint_dof_count,)``, type ``float`` (optional)."""
+        """Per-DOF velocity targets, shape ``(joint_dof_count,)``, type ``float`` (optional). 关节目标速度。"""
 
         self.tri_activations: wp.array | None = None
-        """Array of triangle element activations with shape ``(tri_count,)`` and type ``float``."""
+        """Array of triangle element activations with shape ``(tri_count,)`` and type ``float``. 三角形元素激活力（用于肌肉驱动的布料）。"""
 
         self.tet_activations: wp.array | None = None
-        """Array of tetrahedral element activations with shape with shape ``(tet_count,) and type ``float``."""
+        """Array of tetrahedral element activations with shape with shape ``(tet_count,) and type ``float``. 四面体元素激活力（用于软体机器人的人工肌肉）。"""
 
         self.muscle_activations: wp.array | None = None
         """
@@ -65,7 +69,7 @@ class Control:
         """
 
     def clear(self) -> None:
-        """Reset the control inputs to zero."""
+        """Reset the control inputs to zero. 重置所有控制输入为零。"""
 
         if self.joint_f is not None:
             self.joint_f.zero_()

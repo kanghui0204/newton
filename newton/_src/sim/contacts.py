@@ -30,6 +30,8 @@ class Contacts:
 
     .. note::
         This class is a temporary solution and its interface may change in the future.
+
+    碰撞结果存储：存放碰撞检测管线(CollisionPipeline)产生的接触点数据，供求解器(Solver)读取。
     """
 
     EXTENDED_ATTRIBUTES: frozenset[str] = frozenset(("force",))
@@ -78,19 +80,21 @@ class Contacts:
         Initialize Contacts storage.
 
         Args:
-            rigid_contact_max: Maximum number of rigid contacts
-            soft_contact_max: Maximum number of soft contacts
+            rigid_contact_max: Maximum number of rigid contacts. 刚体接触点缓冲区大小（整个场景的总上限）。
+            soft_contact_max: Maximum number of soft contacts. 软接触点缓冲区大小。
             requires_grad: Whether **soft** contact arrays require gradients for differentiable
                 simulation.  Rigid contact arrays are always allocated without gradients because
                 the narrow phase kernels do not support backward passes.  Soft contact arrays
                 (body_pos, body_vel, normal) are allocated with ``requires_grad`` so that
                 gradient-based optimisation can flow through particle-shape contacts.
+                是否为软接触数组启用梯度（用于可微仿真）。刚体接触永远没有梯度。
             device: Device to allocate buffers on
             per_contact_shape_properties: Enable per-contact stiffness/damping/friction arrays
             clear_buffers: If True, clear() will zero all contact buffers (slower but conservative).
                 If False (default), clear() only resets counts, relying on collision detection
                 to overwrite active contacts. This is much faster (86-90% fewer kernel launches)
                 and safe since solvers only read up to contact_count.
+                True=每次清零所有缓冲区（慢但安全），False=只重置计数器（快，默认）。
             requested_attributes: Set of extended contact attribute names to allocate.
                 See :attr:`EXTENDED_ATTRIBUTES` for available options.
         """
@@ -101,19 +105,19 @@ class Contacts:
             # Layout: [rigid_contact_count, soft_contact_count]
             self._counter_array = wp.zeros(2, dtype=wp.int32)
             # Create sliced views for individual counters (no additional allocation)
-            self.rigid_contact_count = self._counter_array[0:1]
+            self.rigid_contact_count = self._counter_array[0:1]  # 刚体接触计数器（当前帧实际产生了多少个刚体接触点）
 
             # rigid contacts — never requires_grad (narrow phase has enable_backward=False)
-            self.rigid_contact_point_id = wp.zeros(rigid_contact_max, dtype=wp.int32)
-            self.rigid_contact_shape0 = wp.full(rigid_contact_max, -1, dtype=wp.int32)
-            self.rigid_contact_shape1 = wp.full(rigid_contact_max, -1, dtype=wp.int32)
-            self.rigid_contact_point0 = wp.zeros(rigid_contact_max, dtype=wp.vec3)
-            self.rigid_contact_point1 = wp.zeros(rigid_contact_max, dtype=wp.vec3)
-            self.rigid_contact_offset0 = wp.zeros(rigid_contact_max, dtype=wp.vec3)
-            self.rigid_contact_offset1 = wp.zeros(rigid_contact_max, dtype=wp.vec3)
-            self.rigid_contact_normal = wp.zeros(rigid_contact_max, dtype=wp.vec3)
-            self.rigid_contact_thickness0 = wp.zeros(rigid_contact_max, dtype=wp.float32)
-            self.rigid_contact_thickness1 = wp.zeros(rigid_contact_max, dtype=wp.float32)
+            self.rigid_contact_point_id = wp.zeros(rigid_contact_max, dtype=wp.int32)  # 接触点 ID
+            self.rigid_contact_shape0 = wp.full(rigid_contact_max, -1, dtype=wp.int32)  # 碰撞的两个形状的 ID
+            self.rigid_contact_shape1 = wp.full(rigid_contact_max, -1, dtype=wp.int32)  # 碰撞的两个形状的 ID
+            self.rigid_contact_point0 = wp.zeros(rigid_contact_max, dtype=wp.vec3)  # 两个形状上的接触点位置（世界坐标）
+            self.rigid_contact_point1 = wp.zeros(rigid_contact_max, dtype=wp.vec3)  # 两个形状上的接触点位置（世界坐标）
+            self.rigid_contact_offset0 = wp.zeros(rigid_contact_max, dtype=wp.vec3)  # 接触点相对于 body 质心的偏移
+            self.rigid_contact_offset1 = wp.zeros(rigid_contact_max, dtype=wp.vec3)  # 接触点相对于 body 质心的偏移
+            self.rigid_contact_normal = wp.zeros(rigid_contact_max, dtype=wp.vec3)  # 接触法线方向（从 shape0 指向 shape1）
+            self.rigid_contact_thickness0 = wp.zeros(rigid_contact_max, dtype=wp.float32)  # 形状表面厚度
+            self.rigid_contact_thickness1 = wp.zeros(rigid_contact_max, dtype=wp.float32)  # 形状表面厚度
             self.rigid_contact_tids = wp.full(rigid_contact_max, -1, dtype=wp.int32)
             # to be filled by the solver (currently unused)
             self.rigid_contact_force = wp.zeros(rigid_contact_max, dtype=wp.vec3)
@@ -129,12 +133,12 @@ class Contacts:
                 self.rigid_contact_friction = None
 
             # soft contacts — requires_grad flows through here for differentiable simulation
-            self.soft_contact_count = self._counter_array[1:2]
-            self.soft_contact_particle = wp.full(soft_contact_max, -1, dtype=int)
-            self.soft_contact_shape = wp.full(soft_contact_max, -1, dtype=int)
-            self.soft_contact_body_pos = wp.zeros(soft_contact_max, dtype=wp.vec3, requires_grad=requires_grad)
-            self.soft_contact_body_vel = wp.zeros(soft_contact_max, dtype=wp.vec3, requires_grad=requires_grad)
-            self.soft_contact_normal = wp.zeros(soft_contact_max, dtype=wp.vec3, requires_grad=requires_grad)
+            self.soft_contact_count = self._counter_array[1:2]  # 软接触计数器
+            self.soft_contact_particle = wp.full(soft_contact_max, -1, dtype=int)  # 产生接触的粒子 ID
+            self.soft_contact_shape = wp.full(soft_contact_max, -1, dtype=int)  # 产生接触的形状 ID
+            self.soft_contact_body_pos = wp.zeros(soft_contact_max, dtype=wp.vec3, requires_grad=requires_grad)  # 接触点在形状所属 body 的局部坐标（requires_grad=True 时可微）
+            self.soft_contact_body_vel = wp.zeros(soft_contact_max, dtype=wp.vec3, requires_grad=requires_grad)  # 接触点的速度
+            self.soft_contact_normal = wp.zeros(soft_contact_max, dtype=wp.vec3, requires_grad=requires_grad)  # 接触法线（世界坐标）
             self.soft_contact_tids = wp.full(soft_contact_max, -1, dtype=int)
 
             # Extended contact attributes (optional, allocated on demand)
@@ -165,6 +169,8 @@ class Contacts:
 
         If clear_buffers=True (conservative mode), performs full buffer clearing with sentinel
         values and zeros. This requires 7-10 kernel launches but may be useful for debugging.
+
+        清零接触数据。每个仿真子步的 collide() 调用前会自动清零。
         """
         # Clear all counters with a single kernel launch (consolidated counter array)
         self._counter_array.zero_()

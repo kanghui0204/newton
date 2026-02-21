@@ -19,14 +19,16 @@ import warp as wp
 
 
 class State:
-    """
-    Represents the time-varying state of a :class:`Model` in a simulation.
+    """Represents the time-varying state of a :class:`Model` in a simulation.
+    仿真状态：存储每一时刻随时间变化的动态量（位姿、速度、力）。
 
     The State object holds all dynamic quantities that change over time during simulation,
     such as particle and rigid body positions, velocities, and forces, as well as joint coordinates.
 
     State objects are typically created via :meth:`newton.Model.state()` and are used to
     store and update the simulation's current configuration and derived data.
+
+    通过 model.state() 创建。solver.step(state_in, state_out, ...) 读 state_in、写 state_out。
     """
 
     EXTENDED_ATTRIBUTES: frozenset[str] = frozenset(
@@ -72,21 +74,26 @@ class State:
         """
 
         self.particle_q: wp.array | None = None
-        """3D positions of particles, shape (particle_count,), dtype :class:`vec3`."""
+        """3D positions of particles, shape (particle_count,), dtype :class:`vec3`.
+        粒子位置（布料/软体的顶点坐标）。"""
 
         self.particle_qd: wp.array | None = None
-        """3D velocities of particles, shape (particle_count,), dtype :class:`vec3`."""
+        """3D velocities of particles, shape (particle_count,), dtype :class:`vec3`.
+        粒子速度。"""
 
         self.particle_f: wp.array | None = None
-        """3D forces on particles, shape (particle_count,), dtype :class:`vec3`."""
+        """3D forces on particles, shape (particle_count,), dtype :class:`vec3`.
+        粒子上的合力。每步开头 clear_forces() 清零，然后弹簧/碰撞/重力等逐步累加。"""
 
         self.body_q: wp.array | None = None
-        """Rigid body transforms (7-DOF), shape (body_count,), dtype :class:`transform`."""
+        """Rigid body transforms (7-DOF), shape (body_count,), dtype :class:`transform`.
+        刚体位姿。transform = (vec3 位置, quat 旋转)，共 7 个数。"""
 
         self.body_qd: wp.array | None = None
         """Rigid body velocities (spatial), shape (body_count,), dtype :class:`spatial_vector`.
         First three entries: linear velocity relative to the body's center of mass in world frame; last three: angular velocity in world frame.
-        See :ref:`Twist conventions in Newton <Twist conventions>` for more information."""
+        See :ref:`Twist conventions in Newton <Twist conventions>` for more information.
+        刚体速度。spatial_vector = (线速度 vec3, 角速度 vec3)，共 6 个数。"""
 
         self.body_q_prev: wp.array | None = None
         """Previous rigid body transforms for finite-difference velocity computation."""
@@ -102,6 +109,8 @@ class State:
         """Rigid body forces (spatial), shape (body_count,), dtype :class:`spatial_vector`.
         First three entries: linear force in world frame applied at the body's center of mass (COM).
         Last three: torque (moment) in world frame.
+        刚体上的合力。spatial_vector = (力 vec3, 力矩 vec3)。
+        每步开头 clear_forces() 清零，然后碰撞力/关节力/外力等逐步累加。
 
         .. note::
             :attr:`body_f` represents an external wrench in world frame with the body's center of mass (COM) as reference point.
@@ -118,14 +127,19 @@ class State:
         """
 
         self.joint_q: wp.array | None = None
-        """Generalized joint position coordinates, shape (joint_coord_count,), dtype float."""
+        """Generalized joint position coordinates, shape (joint_coord_count,), dtype float.
+        关节广义坐标（角度/位移）。所有关节的坐标按顺序拼接在一个数组里，
+        用 model.joint_q_start[i] 找到关节 i 的起始位置。"""
 
         self.joint_qd: wp.array | None = None
-        """Generalized joint velocity coordinates, shape (joint_dof_count,), dtype float."""
+        """Generalized joint velocity coordinates, shape (joint_dof_count,), dtype float.
+        关节广义速度（角速度/线速度）。布局同 joint_q，
+        用 model.joint_qd_start[i] 找到关节 i 的起始位置。"""
 
     def clear_forces(self) -> None:
-        """
-        Clear all force arrays (for particles and bodies) in the state object.
+        """Clear all force arrays (for particles and bodies) in the state object.
+        清零所有力数组。每个仿真子步的开头都要调用，
+        然后弹簧/碰撞/重力/控制力等会逐步累加到 particle_f 和 body_f 上。
 
         Sets all entries of :attr:`particle_f` and :attr:`body_f` to zero, if present.
         """
